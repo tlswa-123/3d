@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>三渲二室内场景</title>
+<style>
+*{margin:0}body{overflow:hidden;background:#000;font-family:'Microsoft YaHei',sans-serif}canvas{display:block}
+#hint{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:rgba(255,255,255,.5);font-size:12px;background:rgba(0,0,0,.4);padding:8px 20px;border-radius:16px;z-index:100;pointer-events:none;transition:opacity 2s}
+#hint.fade{opacity:0}
+#panel{position:fixed;top:16px;right:16px;background:rgba(18,18,36,.82);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:14px 18px;color:#bbb;font-size:12px;z-index:100;min-width:210px}
+#panel h3{color:#a78bfa;margin-bottom:10px;font-size:13px}
+.pr{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;gap:8px}
+.pr label{min-width:56px;flex-shrink:0}
+.pr input[type=range]{width:90px;accent-color:#6366f1}
+.pr input[type=color]{width:28px;height:22px;border:none;border-radius:3px;cursor:pointer}
+</style>
+</head><body>
+<div id="hint">🖱️ 左键旋转 · 右键平移 · 滚轮缩放 · WASD移动 · QE升降</div>
+<div id="panel"><h3>🎨 三渲二参数</h3>
+<div class="pr"><label>描边粗细</label><input type="range" id="pThick" min="0.3" max="4" step="0.1" value="1.0"></div>
+<div class="pr"><label>描边颜色</label><input type="color" id="pColor" value="#2a2035"></div>
+<div class="pr"><label>环境光</label><input type="range" id="pAmb" min="0" max="6" step="0.1" value="3.0"></div>
+<div class="pr"><label>主灯</label><input type="range" id="pMain" min="0" max="10" step="0.1" value="3.0"></div>
+<div class="pr"><label>色阶数</label><input type="range" id="pSteps" min="2" max="8" step="1" value="2"></div>
+</div>
+
+<script type="importmap">{"imports":{"three":"https://unpkg.com/three@0.162.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.162.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+
+// === 全局 ===
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd8d0e0);
+
+const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 100);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 0.1;
+controls.maxDistance = 20;
+
+let ambLight, dirLight, allMeshes = [], gradMap, composer, edgePass, fxaaPass;
+const mv = { f:0, b:0, l:0, r:0, u:0, d:0 }, spd = 0.08;
+
+// === 色板 — 7 种室内色 ===
+const PALETTE = [
+    new THREE.Color(0xf0e6d3), // 暖米白 — 墙壁
+    new THREE.Color(0xc9b99a), // 木色 — 地板
+    new THREE.Color(0xe8e0f0), // 淡紫 — 天花板
+    new THREE.Color(0x8fb8c9), // 灰蓝
+    new THREE.Color(0xd4a6a6), // 豆沙粉
+    new THREE.Color(0xa8c5a0), // 抹茶绿
+    new THREE.Color(0xd4c08a), // 暖黄
+];
+
+// === Gradient Map ===
+function makeGrad(steps) {
+    const cv = document.createElement('canvas');
+    cv.width = steps; cv.height = 1;
+    const cx = cv.getContext('2d');
+    for (let i = 0; i < steps; i++) {
+        const v = Math.round((i / (steps - 1)) * 255);
+        cx.fillStyle = `rgb(${v},${v},${v})`;
+        cx.fillRect(i, 0, 1, 1);
+    }
+    const t = new THREE.CanvasTexture(cv);
+    t.minFilter = THREE.NearestFilter;
+    t.magFilter = THREE.NearestFilter;
+    return t;
+}
+
+// === 描边 Shader — 基于法线+深度的屏幕空间边缘检测 ===
+// 这里直接对渲染结果做 Sobel，颜色差异大的地方就出描边线
+const OutlineShader = {
+    uniforms: {
+        tDiffuse: { value: null },
+        resolution: { value: new THREE.Vector2() },
+        edgeColor: { value: new THREE.Vector3(0.165, 0.125, 0.21) },
+        thickness: { value: 1.0 },
+    },
+    vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }
+    `,
+    fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec2 resolution;
+        uniform vec3 edgeColor;
+        uniform float thickness;
+        varying vec2 vUv;
+
+        float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+        void main() {
+            vec4 center = texture2D(tDiffuse, vUv);
+            float dx = resolution.x * thickness;
+            float dy = resolution.y * thickness;
+
+            // 8 方向采样
+            float l_tl = luminance(texture2D(tDiffuse, vUv + vec2(-dx, dy)).rgb);
+            float l_tc = luminance(texture2D(tDiffuse, vUv + vec2(0.0, dy)).rgb);
+            float l_tr = luminance(texture2D(tDiffuse, vUv + vec2( dx, dy)).rgb);
+            float l_ml = luminance(texture2D(tDiffuse, vUv + vec2(-dx, 0.0)).rgb);
+            float l_mr = luminance(texture2D(tDiffuse, vUv + vec2( dx, 0.0)).rgb);
+            float l_bl = luminance(texture2D(tDiffuse, vUv + vec2(-dx,-dy)).rgb);
+            float l_bc = luminance(texture2D(tDiffuse, vUv + vec2(0.0,-dy)).rgb);
+            float l_br = luminance(texture2D(tDiffuse, vUv + vec2( dx,-dy)).rgb);
+
+            // Sobel
+            float gx = -l_tl - 2.0*l_ml - l_bl + l_tr + 2.0*l_mr + l_br;
+            float gy = -l_tl - 2.0*l_tc - l_tr + l_bl + 2.0*l_bc + l_br;
+            float edge = sqrt(gx*gx + gy*gy);
+            edge = smoothstep(0.04, 0.15, edge);
+
+            vec3 result = mix(center.rgb, edgeColor, edge);
+            gl_FragColor = vec4(result, 1.0);
+        }
+    `
+};
+
+// === 灯光 ===
+function setupLights() {
+    ambLight = new THREE.AmbientLight(0xffffff, 3.0);
+    scene.add(ambLight);
+
+    dirLight = new THREE.DirectionalLight(0xffffff, 3.0);
+    dirLight.position.set(5, 10, 5);
+    scene.add(dirLight);
+
+    scene.add(new THREE.HemisphereLight(0xddeeff, 0xccaa88, 1.0));
+}
+
+// === 后处理 ===
+function setupPost() {
+    composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+
+    edgePass = new ShaderPass(OutlineShader);
+    const pr = renderer.getPixelRatio();
+    edgePass.uniforms.resolution.value.set(1 / (innerWidth * pr), 1 / (innerHeight * pr));
+    composer.addPass(edgePass);
+
+    fxaaPass = new ShaderPass(FXAAShader);
+    fxaaPass.material.uniforms.resolution.value.set(1 / (innerWidth * pr), 1 / (innerHeight * pr));
+    composer.addPass(fxaaPass);
+}
+
+// === 给顶点按位置上色 ===
+function paintVertexColors(geometry) {
+    const pos = geometry.getAttribute('position');
+    const nor = geometry.getAttribute('normal');
+    const count = pos.count;
+    const colors = new Float32Array(count * 3);
+
+    let minY=Infinity, maxY=-Infinity, minX=Infinity, maxX=-Infinity, minZ=Infinity, maxZ=-Infinity;
+    for (let i = 0; i < count; i++) {
+        const x=pos.getX(i), y=pos.getY(i), z=pos.getZ(i);
+        if(y<minY)minY=y; if(y>maxY)maxY=y;
+        if(x<minX)minX=x; if(x>maxX)maxX=x;
+        if(z<minZ)minZ=z; if(z>maxZ)maxZ=z;
+    }
+    const rY = maxY-minY||1, rX = maxX-minX||1, rZ = maxZ-minZ||1;
+
+    for (let i = 0; i < count; i++) {
+        const x=pos.getX(i), y=pos.getY(i), z=pos.getZ(i);
+        const ny = nor ? Math.abs(nor.getY(i)) : 0.5;
+        const ty = (y-minY)/rY, tx = (x-minX)/rX, tz = (z-minZ)/rZ;
+
+        let col;
+        if (ny > 0.8 && ty < 0.15) {
+            col = PALETTE[1].clone().lerp(PALETTE[6], tx*0.3 + tz*0.2);
+        } else if (ny > 0.8 && ty > 0.88) {
+            col = PALETTE[2].clone().lerp(PALETTE[0], tx*0.15);
+        } else if (ny > 0.7 && ty >= 0.15 && ty <= 0.5) {
+            col = PALETTE[3].clone().lerp(PALETTE[5], tz*0.5 + tx*0.3);
+        } else if (ny < 0.3 && ty < 0.5) {
+            col = PALETTE[0].clone().lerp(PALETTE[4], ty*2*0.4 + tx*0.15);
+        } else if (ny < 0.3 && ty >= 0.5) {
+            col = PALETTE[0].clone().lerp(PALETTE[3], (ty-0.5)*0.5 + tz*0.1);
+        } else if (ty > 0.5) {
+            col = PALETTE[2].clone().lerp(PALETTE[4], tx*0.4);
+        } else {
+            col = PALETTE[6].clone().lerp(PALETTE[5], tz*0.5);
+        }
+
+        const noise = (Math.sin(x*37.7 + z*19.3)*0.5+0.5)*0.03;
+        colors[i*3]   = Math.min(col.r + noise, 1);
+        colors[i*3+1] = Math.min(col.g + noise*0.7, 1);
+        colors[i*3+2] = Math.min(col.b + noise*0.5, 1);
+    }
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+}
+
+// === 创建边标签 Sprite ===
+function makeLabel(text, color) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 128; canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    // 背景
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath();
+    ctx.roundRect(4, 4, 120, 56, 12);
+    ctx.fill();
+    // 文字
+    ctx.font = 'bold 36px Arial';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = color;
+    ctx.fillText(text, 64, 34);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, sizeAttenuation: true });
+    const sprite = new THREE.Sprite(mat);
+    sprite.scale.set(1.2, 0.6, 1);
+    return sprite;
+}
+
+// === 在四条边上画线并标注 ===
+function addEdgeLabels(min, max) {
+    const y = min.y + 0.05; // 贴地面稍微上一点
+    const labelY = min.y + 0.8; // 标签浮在稍高的位置方便看
+
+    // 四条边定义（模型坐标系下）
+    // A: 左边 (X=min), B: 右边 (X=max), C: 后边 (Z=min), D: 前边 (Z=max)
+    const edges = [
+        { name: 'A', color: '#ff6b6b', from: [min.x, y, min.z], to: [min.x, y, max.z], labelPos: [min.x - 0.3, labelY, (min.z+max.z)/2] },
+        { name: 'B', color: '#4ecdc4', from: [max.x, y, min.z], to: [max.x, y, max.z], labelPos: [max.x + 0.3, labelY, (min.z+max.z)/2] },
+        { name: 'C', color: '#ffe66d', from: [min.x, y, min.z], to: [max.x, y, min.z], labelPos: [(min.x+max.x)/2, labelY, min.z - 0.3] },
+        { name: 'D', color: '#a78bfa', from: [min.x, y, max.z], to: [max.x, y, max.z], labelPos: [(min.x+max.x)/2, labelY, max.z + 0.3] },
+    ];
+
+    edges.forEach(e => {
+        // 画线
+        const pts = [new THREE.Vector3(...e.from), new THREE.Vector3(...e.to)];
+        const geo = new THREE.BufferGeometry().setFromPoints(pts);
+        const mat = new THREE.LineBasicMaterial({ color: e.color, linewidth: 2 });
+        const line = new THREE.Line(geo, mat);
+        scene.add(line);
+
+        // 标签
+        const label = makeLabel(e.name, e.color);
+        label.position.set(...e.labelPos);
+        scene.add(label);
+    });
+}
+
+// === 处理单个模型的 mesh ===
+function processMesh(ch) {
+    if (!ch.isMesh) return;
+    allMeshes.push(ch);
+    if (!ch.geometry.getAttribute('normal')) {
+        ch.geometry.computeVertexNormals();
+    }
+    paintVertexColors(ch.geometry);
+    ch.material = new THREE.MeshToonMaterial({
+        vertexColors: true,
+        gradientMap: gradMap,
+        side: THREE.DoubleSide,
+    });
+}
+
+// === 加载模型 ===
+function loadModel() {
+    gradMap = makeGrad(2);
+
+    new GLTFLoader().load('housein.glb', gltf => {
+        const model = gltf.scene;
+
+        // 缩放
+        const box = new THREE.Box3().setFromObject(model);
+        const sz = box.getSize(new THREE.Vector3());
+        const sc = 10 / Math.max(sz.x, sz.y, sz.z);
+        model.scale.setScalar(sc);
+
+        // 居中落地
+        const b2 = new THREE.Box3().setFromObject(model);
+        const c2 = b2.getCenter(new THREE.Vector3());
+        model.position.sub(new THREE.Vector3(c2.x, b2.min.y, c2.z));
+
+        // 处理原始模型
+        allMeshes = [];
+        model.traverse(ch => processMesh(ch));
+        scene.add(model);
+
+        // 获取原始模型包围盒
+        const fb = new THREE.Box3().setFromObject(model);
+        const width = fb.max.x - fb.min.x;   // X 宽度
+        const depth = fb.max.z - fb.min.z;   // Z 深度
+
+        // ★ 沿 A 边 (X=min) 镜像复制到左边
+        const leftClone = model.clone(true);
+        leftClone.scale.x *= -1;
+        leftClone.position.x = model.position.x - width;
+        leftClone.traverse(ch => {
+            if (!ch.isMesh) return;
+            allMeshes.push(ch);
+            ch.material = ch.material.clone();
+            ch.material.side = THREE.DoubleSide;
+        });
+        scene.add(leftClone);
+
+        // ★ 沿 D 边 (Z=max, 前边) 镜像复制到前面
+        // 当前场景有两个模型（原始 + A镜像），都要沿 D 镜像
+        // 先对原始模型沿 D 镜像
+        const frontClone = model.clone(true);
+        frontClone.scale.z *= -1;
+        frontClone.position.z = model.position.z + depth;
+        frontClone.traverse(ch => {
+            if (!ch.isMesh) return;
+            allMeshes.push(ch);
+            ch.material = ch.material.clone();
+            ch.material.side = THREE.DoubleSide;
+        });
+        scene.add(frontClone);
+
+        // 对 A 镜像的那个也沿 D 镜像
+        const frontLeftClone = leftClone.clone(true);
+        frontLeftClone.scale.z *= -1;
+        frontLeftClone.position.z = leftClone.position.z + depth;
+        frontLeftClone.traverse(ch => {
+            if (!ch.isMesh) return;
+            allMeshes.push(ch);
+            ch.material = ch.material.clone();
+            ch.material.side = THREE.DoubleSide;
+        });
+        scene.add(frontLeftClone);
+
+        // 获取所有模型合在一起的总包围盒
+        const totalBox = new THREE.Box3();
+        totalBox.expandByObject(model);
+        totalBox.expandByObject(leftClone);
+        totalBox.expandByObject(frontClone);
+        totalBox.expandByObject(frontLeftClone);
+        const tc = totalBox.getCenter(new THREE.Vector3());
+        const ts = totalBox.getSize(new THREE.Vector3());
+
+        console.log('四个模型总大小:', ts);
+
+        // 摄像机拉远看全貌
+        camera.position.set(tc.x, totalBox.max.y + 5, tc.z + ts.z * 0.9);
+        controls.target.set(tc.x, tc.y, tc.z);
+        controls.update();
+
+        setTimeout(() => document.getElementById('hint').classList.add('fade'), 5000);
+    },
+    xhr => { if(xhr.total) console.log('加载:', Math.round(xhr.loaded/xhr.total*100)+'%'); },
+    err => console.error('加载失败:', err));
+}
+
+// === 键盘 ===
+addEventListener('keydown', e => {
+    if(e.code==='KeyW'||e.code==='ArrowUp')mv.f=1;if(e.code==='KeyS'||e.code==='ArrowDown')mv.b=1;
+    if(e.code==='KeyA'||e.code==='ArrowLeft')mv.l=1;if(e.code==='KeyD'||e.code==='ArrowRight')mv.r=1;
+    if(e.code==='KeyE')mv.u=1;if(e.code==='KeyQ')mv.d=1;
+});
+addEventListener('keyup', e => {
+    if(e.code==='KeyW'||e.code==='ArrowUp')mv.f=0;if(e.code==='KeyS'||e.code==='ArrowDown')mv.b=0;
+    if(e.code==='KeyA'||e.code==='ArrowLeft')mv.l=0;if(e.code==='KeyD'||e.code==='ArrowRight')mv.r=0;
+    if(e.code==='KeyE')mv.u=0;if(e.code==='KeyQ')mv.d=0;
+});
+
+function doMove() {
+    const dir = new THREE.Vector3(); camera.getWorldDirection(dir); dir.y=0; dir.normalize();
+    const rt = new THREE.Vector3().crossVectors(dir, camera.up).normalize();
+    const m = new THREE.Vector3();
+    if(mv.f)m.add(dir);if(mv.b)m.sub(dir);if(mv.r)m.add(rt);if(mv.l)m.sub(rt);
+    if(mv.u)m.y+=1;if(mv.d)m.y-=1;
+    if(m.lengthSq()>0){m.normalize().multiplyScalar(spd);camera.position.add(m);controls.target.add(m);}
+}
+
+// === 面板 ===
+function setupPanel() {
+    const $ = id => document.getElementById(id);
+    $('pThick').oninput = e => edgePass.uniforms.thickness.value = +e.target.value;
+    $('pColor').oninput = e => {
+        const c = new THREE.Color(e.target.value);
+        edgePass.uniforms.edgeColor.value.set(c.r, c.g, c.b);
+    };
+    $('pAmb').oninput = e => ambLight.intensity = +e.target.value;
+    $('pMain').oninput = e => dirLight.intensity = +e.target.value;
+    $('pSteps').oninput = e => {
+        gradMap = makeGrad(+e.target.value);
+        allMeshes.forEach(m => {
+            if(m.material.isMeshToonMaterial){ m.material.gradientMap = gradMap; m.material.needsUpdate = true; }
+        });
+    };
+}
+
+// === Resize ===
+addEventListener('resize', () => {
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
+    const pr = renderer.getPixelRatio();
+    edgePass.uniforms.resolution.value.set(1/(innerWidth*pr), 1/(innerHeight*pr));
+    fxaaPass.material.uniforms.resolution.value.set(1/(innerWidth*pr), 1/(innerHeight*pr));
+});
+
+// === 主循环 ===
+function animate() {
+    requestAnimationFrame(animate);
+    doMove();
+    controls.update();
+    composer.render();
+}
+
+setupLights();
+setupPost();
+loadModel();
+setupPanel();
+animate();
+</script>
+</body></html>
